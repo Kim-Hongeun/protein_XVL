@@ -2,23 +2,19 @@ import torch
 import torch.nn.functional as F
 from torch import nn 
 from xbert import BertConfig, BertForMaskedLM
-from transformers import EsmForMaskedLM, EsmConfig
+from transformers import EsmModel, EsmForMaskedLM, EsmConfig
 
 class proteinXVL(nn.Module):
-    def __init__(self, 
-                 protein_tokenizer = None,
-                 smiles_tokenizer = None,
+    def __init__(self,
                  config = None,
                  temp = 0.07
                  ):
         super().__init__()
 
         embed_dim = config['embed_dim']
-        self.protein_tokenizer = protein_tokenizer
-        self.smiles_tokenizer = smiles_tokenizer
 
-        protein_config = EsmConfig.from_json_file('./config_bert_protein_encoder.json')
-        self.proteinEncoder = EsmForMaskedLM.from_pretrained("facebook/esm2_t12_35M_UR50D")
+        protein_config = EsmConfig('./config_bert_protein_encoder.json')
+        self.proteinEncoder = EsmModel.from_pretrained("facebook/esm2_t12_35M_UR50D")
         
         smiles_config = BertConfig.from_json_file('./config_bert_smiles_and_fusion_encoder.json')
         self.smilesEncoder = BertForMaskedLM(config = smiles_config)
@@ -29,15 +25,18 @@ class proteinXVL(nn.Module):
         self.smilesProj = nn.Linear(smilesWidth, embed_dim)
         self.proteinProj = nn.Linear(proteinWidth, embed_dim)
 
-        self.affinity_reg = nn.Sequential(nn.Linear(proteinWidth+smilesWidth, (proteinWidth+smilesWidth)*0.5))
+        self.affinity_reg = nn.Sequential(nn.Linear(proteinWidth+smilesWidth, (proteinWidth+smilesWidth)//2),
+                                          nn.GELU(),
+                                          nn.LayerNorm((proteinWidth+smilesWidth)//2, smiles_config.layer_norm_eps),
+                                          nn.Linear((proteinWidth+smilesWidth)//2, 1))
         
         self.temp = nn.Parameter(torch.ones([]) * temp)
-        self.queue_size = config['queque_size']
+        self.queue_size = config['queue_size']
         self.momentum = config['momentum']
 
         ### Momentum Model ###
         self.smilesEncoder_m = BertForMaskedLM(config = smiles_config)
-        self.proteinEncoder_m = EsmForMaskedLM(config = protein_config)
+        self.proteinEncoder_m = EsmModel.from_pretrained("facebook/esm2_t12_35M_UR50D")
         
         self.smilesProj_m = nn.Linear(smilesWidth, embed_dim)
         self.proteinProj_m = nn.Linear(proteinWidth, embed_dim)
@@ -50,24 +49,24 @@ class proteinXVL(nn.Module):
         self.copy_params()
 
         #Create queue
-        self.register_buffer("protein_queue", torch.randn(embed_dim, self.queqeq_size))
+        self.register_buffer("protein_queue", torch.randn(embed_dim, self.queue_size))
         self.register_buffer("smiles_queue", torch.randn(embed_dim, self.queue_size))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
         self.protein_queue = nn.functional.normalize(self.protein_queue, dim=0)
         self.smiles_queue = nn.functional.normalize(self.smiles_queue, dim=0)
         
-    def forward(self, proteinIds, smilesIds, protAttentionMask, smilesAttentionMask, alpha):
+    def forward(self, proteinIds, smilesIds, protAttentionMask, smilesAttentionMask, affinity_target, alpha):
 
         with torch.no_grad():
             self.temp.clamp_(0.01, 0.5)
         
         #1 Protein Embedding
-        encProtein = self.proteinEncoder(proteinIds, encoder_attention_mask=protAttentionMask, return_dict=True).last_hidden_state
+        encProtein = self.proteinEncoder(proteinIds, attention_mask=protAttentionMask, return_dict=True).last_hidden_state
         proteinFeats= F.normalize(self.proteinProj(encProtein[:,0,:]), dim=-1)
 
         #2 SMILES Embedding
-        encSMILES = self.smilesEncoder(smilesIds, encoder_attention_mask=smilesAttentionMask, retrun_dict=True)
+        encSMILES = self.smilesEncoder.bert(smilesIds, attention_mask=smilesAttentionMask, return_dict=True, mode='text').last_hidden_state
         smilesFeats = F.normalize(self.smilesProj(encSMILES[:,0,:]), dim=-1)
 
         #3 Contrastive Loss
@@ -79,7 +78,7 @@ class proteinXVL(nn.Module):
             proteinFeats_m = F.normalize(self.proteinProj_m(encProtein_m[:,0,:]), dim=-1)
             proteinFeatsAll = torch.cat([proteinFeats_m.t(), self.protein_queue.clone().detach()], dim=1)
 
-            encSMILES_m = self.smilesEncoder_m(smilesIds, encoder_attention_mask=smilesAttentionMask, return_dict=True).last_hidden_state
+            encSMILES_m = self.smilesEncoder_m.bert(smilesIds, encoder_attention_mask=smilesAttentionMask, return_dict=True, mode='text').last_hidden_state
             smilesFeats_m = F.normalize(self.smilesProj_m(encSMILES_m[:,0,:]), dim=-1)
             smilesFeatsAll = torch.cat([smilesFeats_m.t(), self.protein_queue.clone().detach()], dim=1)
 
@@ -113,10 +112,37 @@ class proteinXVL(nn.Module):
         self._dequeue_and_enqueue(proteinFeats_m, smilesFeats_m)
 
         # Regression(Binding Affinity) Loss
-        
 
-        regression_loss = None
-        return contrastive_loss + regression_loss
+        # print("encProtein shape: ", encProtein.shape)
+        # print("protAttentionMask shape: ", protAttentionMask.shape)
+        # print("encSMILES shape: ", encSMILES.shape)
+        # print("smilesAttentionMask shape: ", smilesAttentionMask.shape)
+
+        outputProtein = self.smilesEncoder.bert(encoder_embeds = encProtein,
+                                                attention_mask = protAttentionMask,
+                                                encoder_hidden_states = encSMILES,
+                                                encoder_attention_mask = smilesAttentionMask,
+                                                return_dict = True,
+                                                mode='fusion'
+                                                ).last_hidden_state[:,0,:]
+
+        outputSMILES = self.smilesEncoder.bert(encoder_embeds = encSMILES,
+                                               attention_mask = smilesAttentionMask,
+                                               encoder_hidden_states = encProtein,
+                                               encoder_attention_mask = protAttentionMask,
+                                               return_dict = True,
+                                               mode='fusion'
+                                               ).last_hidden_state[:,0,:]
+        
+        affinity_pred = self.affinity_reg(torch.cat((outputProtein, outputSMILES), dim=1)).to(torch.float64)
+
+        loss_mse = nn.MSELoss()
+        regression_loss = loss_mse(affinity_pred, affinity_target)
+        
+        #print(affinity_target.shape)
+        #print(affinity_pred.shape)
+        
+        return contrastive_loss, regression_loss
 
 
  
@@ -135,17 +161,17 @@ class proteinXVL(nn.Module):
                 param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
 
     @torch.no_grad()
-    def _dequeue_and_enqueue(self, property_feat, smiles_feat):
+    def _dequeue_and_enqueue(self, protein_feat, smiles_feat):
 
-        property_feats = property_feat
+        protein_feats = protein_feat
         smiles_feats = smiles_feat
 
-        batch_size = property_feats.shape[0]
+        batch_size = protein_feats.shape[0]
 
         ptr = int(self.queue_ptr)
         assert self.queue_size % batch_size == 0
 
-        self.property_queue[:, ptr:ptr + batch_size] = property_feats.T
+        self.protein_queue[:, ptr:ptr + batch_size] = protein_feats.T
         self.smiles_queue[:, ptr:ptr + batch_size] = smiles_feats.T
         ptr = (ptr + batch_size) % self.queue_size 
 

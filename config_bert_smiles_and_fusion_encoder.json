@@ -13,10 +13,10 @@
   "model_type": "bert",
   "num_attention_heads": 8,
   "num_hidden_layers": 8,
-  "pad_token_id": 0,
+  "pad_token_id": 1,
   "type_vocab_size": 2,
   "vocab_size": 300,
   "fusion_layer": 4,
-  "encoder_width": 384,
+  "encoder_width": 480,
   "autoregressive": 0
 }
